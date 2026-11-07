@@ -35,9 +35,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -45,6 +47,8 @@ import urllib.request
 import zipfile
 import zlib
 from pathlib import Path
+
+APP_VERSION = "1.0.1"
 
 APP_DIR = Path(__file__).resolve().parent.parent
 FRAMEWORK_CACHE = APP_DIR / "framework-cache"
@@ -450,17 +454,47 @@ def _git_clone(url, dest, recursive, log):
 
 
 def _run(cmd, log, cwd=None, timeout=None):
-    log_line(log, "$ " + " ".join(str(c) for c in cmd))
-    proc = subprocess.Popen([str(c) for c in cmd], cwd=cwd,
+    """Run a child, streaming its output to the log, with a REAL
+    wall-clock timeout.
+
+    Field failure (Duane, 2026-11-05): a GBC batch sat overnight on
+    one title because gbrecomp's analysis prints nothing while it
+    spins — the old loop read the child's output stream and only
+    enforced the timeout after the stream ended, so a silent child
+    hung the queue forever. The deadline is now enforced against
+    the process itself: output is drained on a thread, and when the
+    clock runs out the child's whole process group is killed and a
+    RuntimeError names the command and the timeout."""
+    cmd = [str(c) for c in cmd]
+    log_line(log, "$ " + " ".join(cmd))
+    proc = subprocess.Popen(cmd, cwd=cwd,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1,
+                            start_new_session=True)
+
+    def _drain():
+        try:
+            for line in proc.stdout:
+                log_line(log, line.rstrip())
+        except (ValueError, OSError):
+            pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
     try:
-        for line in proc.stdout:
-            log_line(log, line.rstrip())
-    finally:
         proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.wait()
+        reader.join(timeout=5)
+        raise RuntimeError(
+            f"timed out after {timeout} s and was killed: {' '.join(cmd)}")
+    reader.join(timeout=5)
     if proc.returncode != 0:
-        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(str(c) for c in cmd)}")
+        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}")
     return proc.returncode
 
 
@@ -999,8 +1033,23 @@ def scaffold_project(job, probe, gb_dir, gbrecomp, log, ra_on=False):
         shutil.rmtree(gen)
     if not (gen / "CMakeLists.txt").exists():
         log_line(log, "generating project with gbrecomp (auto-analysis)…")
-        _run([str(gbrecomp), str(staged_rom), "-o", str(gen)], log,
-             cwd=proj, timeout=1800)
+        gen_cmd = [str(gbrecomp), str(staged_rom), "-o", str(gen)]
+        # gbrecomp's aggressive code scan scales superlinearly with
+        # ROM size: on 4 MB carts it does not finish in any practical
+        # window (Duane's GBC batch sat on one title overnight,
+        # 2026-11-05; diagnosis in gb-hang/REPORT.md). Entry-point
+        # analysis alone finds the full real function set, so for
+        # large ROMs skip the scan. Small ROMs keep the exact
+        # pre-v1.0.1 command line.
+        if probe["size"] >= 2 * 1024 * 1024:
+            log_line(log, "ROM ≥2 MB: aggressive scan skipped "
+                          "(--no-scan; the scan scales badly on "
+                          "large ROMs)")
+            gen_cmd.append("--no-scan")
+        try:
+            _run(gen_cmd, log, cwd=proj, timeout=1800)
+        except RuntimeError as e:
+            raise RuntimeError(f"generate stage (gbrecomp): {e}")
     # The generated CMakeLists hardcodes GBRT_DIR relative to wherever
     # gbrecomp ran (it expects to live inside the framework tree).
     # Point it at the real runtime.
@@ -1261,7 +1310,14 @@ def main(argv):
     if cmd == "run":
         job_path = argv[argv.index("--job") + 1]
         job = json.loads(Path(job_path).read_text())
-        result = run_job(job)
+        try:
+            result = run_job(job)
+        except Exception as e:  # noqa: BLE001 — a failed item must
+            # read as failed, never as a bare traceback or a done.
+            print(f"FAILED {job.get('title')}: {e}")
+            print(json.dumps({"RESULT": "failed", "error": str(e)},
+                             indent=2))
+            return 1
         print(json.dumps({"RESULT": result["status"], **result}, indent=2))
         return 0 if result["status"] == "done" else 1
     print("unknown command: " + cmd)
