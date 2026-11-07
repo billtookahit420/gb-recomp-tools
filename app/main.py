@@ -131,12 +131,15 @@ class Worker(QThread):
         self.settings = settings
 
     def run(self):
+        done = partial = review = 0
+        failures = []
         for row, job in self.items:
             self.status.emit(row, "converting…")
             try:
                 result = engine.run_job(job, log=self.log.emit)
                 if result["status"] == "needs_review":
                     self.status.emit(row, "needs review")
+                    review += 1
                 elif result.get("failed_targets"):
                     ok = ", ".join(sorted(result.get("packages", {})))
                     self.status.emit(row, f"done ({ok} only)")
@@ -145,11 +148,23 @@ class Worker(QThread):
                         "failed: " + "; ".join(
                             f"{t}: {m}" for t, m in
                             result["failed_targets"].items()))
+                    partial += 1
                 else:
                     self.status.emit(row, "done")
+                    done += 1
             except Exception as e:  # noqa: BLE001
                 self.log.emit(f"FAILED {job.get('title')}: {e}")
                 self.status.emit(row, "failed")
+                failures.append((job.get("title"), str(e)))
+        # End-of-run summary: a failed item must be impossible to
+        # miss — it is counted and named here, with the stage that
+        # failed, not just left as a line in the scrollback.
+        total = len(self.items)
+        self.log.emit(
+            f"Summary: {total} item(s): {done} done, {partial} "
+            f"partial, {review} needs review, {len(failures)} failed")
+        for title, err in failures:
+            self.log.emit(f"Summary FAILED: {title}: {err}")
         self.finished_all.emit()
 
 
@@ -200,7 +215,7 @@ def _cgb_label(probe):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GBRecomp Tools")
+        self.setWindowTitle(f"GBRecomp Tools {engine.APP_VERSION}")
         self.resize(1180, 760)
         self.items = []             # list of probe dicts (+ status)
         self.worker = None
