@@ -1,5 +1,8 @@
 # GBRecomp Tools
 
+**Version 1.0.1** — fixes large ROMs (2 MB and up) hanging the
+conversion forever; see RELEASE-NOTES-v1.0.1.md.
+
 Converts your Game Boy / Game Boy Color ROMs into native PC games —
 Linux and Windows executables with a launcher, box art, save states,
 and link-cable play over the network — using
